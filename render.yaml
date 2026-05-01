@@ -9,5 +9,7 @@ services:
         value: "0.0.0.0"
       - key: AUTO_OPEN_BROWSER
         value: "0"
+      - key: DEMO_MODE
+        value: "1"
     plan: free
     region: oregon

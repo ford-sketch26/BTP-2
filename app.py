@@ -31,6 +31,11 @@ from src.safety_score import compute_safety_score
 import os
 PORT = int(os.environ.get("PORT", "8000"))
 BIND_HOST = os.environ.get("BIND_HOST", "127.0.0.1")  # set to "0.0.0.0" to allow external connections (ngrok / cloud deploy)
+# When set, the app serves from the pre-built safety_panel.csv instead of fetching live.
+# Trades freshness for instant response — perfect for a public demo where strangers
+# would otherwise hit slow yfinance / CT.gov calls.
+DEMO_MODE = os.environ.get("DEMO_MODE", "0") == "1"
+DEMO_PANEL_PATH = "data/processed/safety_panel.csv"
 
 # (ticker, max_pages) -> {names, trials, events, arms, safety, panel}
 _CACHE: dict[tuple[str, int], dict[str, Any]] = {}
@@ -156,8 +161,75 @@ def _score_label(score: float | None) -> str:
 
 # ============================== pipeline =====================================
 
+# Cached panel (loaded once in DEMO_MODE)
+_DEMO_PANEL: pd.DataFrame | None = None
+
+
+def _load_demo_panel() -> pd.DataFrame:
+    global _DEMO_PANEL
+    if _DEMO_PANEL is None:
+        _DEMO_PANEL = pd.read_csv(DEMO_PANEL_PATH)
+    return _DEMO_PANEL
+
+
+def _run_pipeline_demo(ticker: str) -> dict[str, Any]:
+    """Demo-mode pipeline: filter the pre-built panel CSV. Instant response.
+
+    Trade-offs vs live mode:
+      * No live freshness — uses the snapshot from the last `python -m src.build_panel` run.
+      * No drill-in side-effect tables (events_df is empty) — drill-in shows
+        metadata + score + a link to clinicaltrials.gov for full per-arm detail.
+      * Only the 10 watchlist tickers will return data.
+    """
+    panel_full = _load_demo_panel()
+    sub = panel_full[panel_full["ticker"] == ticker.upper()].copy()
+    if sub.empty:
+        available = sorted(panel_full["ticker"].dropna().unique().tolist())
+        raise ValueError(
+            f"Ticker {ticker!r} is not in the demo dataset. "
+            f"Available: {', '.join(available)}"
+        )
+
+    trial_cols = [
+        "nct_id", "brief_title", "lead_sponsor", "phase", "study_type",
+        "enrollment_count", "conditions", "intervention_names",
+        "completion_date", "results_first_posted", "has_adverse_events", "n_arms",
+    ]
+    trials_df = sub[[c for c in trial_cols if c in sub.columns]].drop_duplicates("nct_id").reset_index(drop=True)
+
+    score_cols = [
+        "nct_id", "drug_arms_n", "placebo_arms_n",
+        "drug_at_risk", "drug_affected", "drug_rate",
+        "placebo_at_risk", "placebo_affected", "placebo_rate",
+        "safety_score", "score_basis",
+    ]
+    safety_df = sub[[c for c in score_cols if c in sub.columns]].drop_duplicates("nct_id").reset_index(drop=True)
+
+    panel_local = trials_df.merge(safety_df, on="nct_id", how="left")
+
+    return {
+        "names": [f"(demo data — {len(trials_df)} pre-loaded trials for {ticker.upper()})"],
+        "trials_df": trials_df,
+        "events_df": pd.DataFrame(),  # empty -> drill-in will show only metadata + score
+        "arms_df": pd.DataFrame(),
+        "safety_df": safety_df,
+        "panel": panel_local,
+    }
+
+
 def _run_pipeline(ticker: str, max_pages: int) -> dict[str, Any]:
     """Resolve, fetch, clean, score, cache. Returns everything the UI needs."""
+    if DEMO_MODE:
+        # In demo mode we ignore max_pages — there's only one snapshot per ticker.
+        key = (ticker, 0)
+        with _CACHE_LOCK:
+            if key in _CACHE:
+                return _CACHE[key]
+        bundle = _run_pipeline_demo(ticker)
+        with _CACHE_LOCK:
+            _CACHE[key] = bundle
+        return bundle
+
     key = (ticker, max_pages)
     with _CACHE_LOCK:
         if key in _CACHE:
@@ -191,13 +263,44 @@ def _run_pipeline(ticker: str, max_pages: int) -> dict[str, Any]:
 # ============================== views ========================================
 
 def _home_view() -> str:
+    quick_links_html = ""
+    demo_note = ""
+    if DEMO_MODE:
+        try:
+            tickers = sorted(_load_demo_panel()["ticker"].dropna().unique().tolist())
+        except Exception:
+            tickers = []
+        if tickers:
+            buttons = "".join(
+                f'<a href="/run?ticker={t}" '
+                f'style="display:inline-block;padding:0.5em 1em;margin:0.25em;'
+                f'background:#2b6cb0;color:white;border-radius:6px;'
+                f'text-decoration:none;font-weight:600">{t}</a>'
+                for t in tickers
+            )
+            quick_links_html = f"""
+<h3 style="margin-top: 1em">Or click any pre-loaded ticker for an instant view:</h3>
+<div>{buttons}</div>
+"""
+        demo_note = """
+<div class="warn-box">
+  <strong>Demo mode:</strong> serving from a snapshot of clinicaltrials.gov data
+  (last updated 2026-04-30). Only the watchlist tickers below have data. For a
+  fully-live version (any ticker, freshly fetched), run the project locally —
+  see the README on the GitHub repo.
+</div>
+"""
+
     body = f"""
-<h1>Biopharma Trial Explorer</h1>
-<p class="subtitle">Type a US biopharma ticker. We'll pull every completed clinical trial,
-break out the side-effect data, score how scary each drug looks compared to placebo,
-and surface the alarming ones.</p>
+<h1>Biopharma Trial Safety Explorer</h1>
+<p class="subtitle">Type a US biopharma ticker. We'll show every completed clinical trial,
+score how scary each drug looks compared to placebo, and surface the alarming ones.</p>
+
+{demo_note}
 
 {_form_html()}
+
+{quick_links_html}
 
 <div class="help-box" style="margin-top: 1.5em">
   <strong>What you'll see after fetching:</strong>
@@ -205,7 +308,7 @@ and surface the alarming ones.</p>
     <li><strong>Headline metrics</strong> — how many trials we found, how many had side-effect data, how many had a placebo arm we could compare against</li>
     <li><strong>Alerts</strong> — the trials whose drug arm looks much worse than placebo (the "you should look at this" list)</li>
     <li><strong>Safety-score table</strong> — every trial we could score, sortable</li>
-    <li><strong>Drill-in</strong> — pick any trial, see the per-arm comparison with a verification link to clinicaltrials.gov</li>
+    <li><strong>Drill-in</strong> — pick any trial, see metadata + score, with a verification link to clinicaltrials.gov</li>
   </ol>
 </div>
 
