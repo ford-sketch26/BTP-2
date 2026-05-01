@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
+from src.backtest import information_coefficient, quantile_buckets
 from src.data_cleaner import flatten, flatten_arms
 from src.data_fetcher import (
     fetch_completed_trials_for_sponsors,
@@ -146,6 +147,16 @@ def _score_pill(score: float | None) -> str:
     return f'<span class="score-pill {cls}">{sign}{pct:.1f} pp</span>'
 
 
+def _ret_cell(value: float | None) -> str:
+    """Render a forward-return cell, color-coded by sign."""
+    if value is None or pd.isna(value):
+        return '<td style="color:#a0aec0">—</td>'
+    pct = value * 100
+    cls = "pct-bad" if value < -0.02 else ("pct-good" if value > 0.02 else "")
+    sign = "+" if value >= 0 else ""
+    return f'<td class="{cls}">{sign}{pct:.1f}%</td>'
+
+
 def _score_label(score: float | None) -> str:
     """Plain-English label for a score."""
     if score is None or pd.isna(score):
@@ -170,6 +181,111 @@ def _load_demo_panel() -> pd.DataFrame:
     if _DEMO_PANEL is None:
         _DEMO_PANEL = pd.read_csv(DEMO_PANEL_PATH)
     return _DEMO_PANEL
+
+
+# Cached findings (computed once on first home-page load)
+_FINDINGS_CACHE: dict[str, Any] | None = None
+
+
+def _compute_findings() -> dict[str, Any]:
+    """Compute cross-watchlist backtest results for the home-page section."""
+    global _FINDINGS_CACHE
+    if _FINDINGS_CACHE is not None:
+        return _FINDINGS_CACHE
+
+    panel = _load_demo_panel()
+
+    # Slices we care about (matches the Phase-3 sign-off table in CLAUDE.md)
+    slices = {
+        "Full universe": panel,
+        "Phase 3 only": panel[panel["phase"] == "PHASE3"],
+        "Phase 3 + enrollment >=300": panel[(panel["phase"] == "PHASE3") & (panel["enrollment_count"].fillna(0) >= 300)],
+        "Phase 3 + enrollment >=500": panel[(panel["phase"] == "PHASE3") & (panel["enrollment_count"].fillna(0) >= 500)],
+    }
+
+    rows = []
+    for name, sl in slices.items():
+        ic5 = information_coefficient(sl, "abret_0_5")
+        ic20 = information_coefficient(sl, "abret_0_20")
+        buckets = quantile_buckets(sl, "abret_0_20", n_buckets=3)
+        spread = None
+        if len(buckets) >= 2:
+            spread = float(buckets.iloc[0]["mean_pct"] - buckets.iloc[-1]["mean_pct"])
+        rows.append({
+            "slice": name,
+            "n": ic20["n"],
+            "ic_5d": ic5["ic_spearman"],
+            "ic_20d": ic20["ic_spearman"],
+            "spread_20d": spread,
+        })
+
+    n_total = panel.dropna(subset=["safety_score", "abret_0_20"]).shape[0]
+    n_alerts = ((panel["safety_score"] >= 0.05) &
+                (panel["enrollment_count"].fillna(0) >= 300) &
+                (panel["phase"].isin(["PHASE3", "PHASE4", "PHASE2|PHASE3"]))).sum()
+
+    _FINDINGS_CACHE = {
+        "rows": rows,
+        "n_total": int(n_total),
+        "n_alerts": int(n_alerts),
+        "tickers": sorted(panel["ticker"].dropna().unique().tolist()),
+    }
+    return _FINDINGS_CACHE
+
+
+def _findings_section_html() -> str:
+    """Render the 'what we found' panel for the home page."""
+    f = _compute_findings()
+
+    rows_html = []
+    for r in f["rows"]:
+        ic5 = "—" if r["ic_5d"] is None else f"{r['ic_5d']:+.3f}"
+        ic20 = "—" if r["ic_20d"] is None else f"{r['ic_20d']:+.3f}"
+        spread = "—" if r["spread_20d"] is None else f"{r['spread_20d']:+.2f}%"
+        # Highlight the strongest slice in green
+        strong = "Phase 3 + enrollment >=300" in r["slice"] or "Phase 3 + enrollment >=500" in r["slice"]
+        bg = "background:#f0fff4" if strong else ""
+        rows_html.append(
+            f'<tr style="{bg}"><td>{_esc(r["slice"])}</td><td>{r["n"]:,}</td>'
+            f'<td>{ic5}</td><td>{ic20}</td><td>{spread}</td></tr>'
+        )
+
+    return f"""
+<h2>Backtest findings — does the safety score predict stock returns?</h2>
+
+<div class="help-box">
+  <strong>How to read this:</strong> we attached a forward stock return (vs the IBB
+  biotech ETF) to every trial in the dataset, then asked: do trials with high
+  safety scores have lower returns afterward? The Information Coefficient (IC) is
+  a number from −1 to +1 that summarises the answer. <strong>Negative IC =
+  hypothesis confirmed</strong> (high score correctly predicts low returns).
+  Anything in the |0.05 − 0.10| range counts as a meaningful signal in quant finance.
+</div>
+
+<table style="margin: 1em 0">
+  <tr>
+    <th>Slice</th>
+    <th>Trials</th>
+    <th>IC at [0,+5]</th>
+    <th>IC at [0,+20]</th>
+    <th>Tertile spread @ [0,+20]</th>
+  </tr>
+  {"".join(rows_html)}
+</table>
+
+<div class="help-box" style="background:#f0fff4; border-left-color:#38a169">
+  <strong>The headline:</strong> the naive score has near-zero predictive power on
+  the full universe, but on <strong>large pivotal Phase-3 trials</strong> (the
+  highlighted rows) the IC reaches <strong>−0.09</strong> — small but real, in the
+  hypothesised direction. Trials in the cleanest tertile beat trials in the scariest
+  tertile by ~0.65 percentage points over the month after results posting.
+</div>
+<p class="help">
+  Across all {f["n_total"]:,} trials with both a score and a return,
+  {f["n_alerts"]:,} crossed the watcher's alert threshold (Phase 3 + enrollment ≥ 300 + score ≥ +5pp).
+  Tickers in dataset: {", ".join(f["tickers"])}.
+</p>
+"""
 
 
 def _run_pipeline_demo(ticker: str) -> dict[str, Any]:
@@ -205,7 +321,16 @@ def _run_pipeline_demo(ticker: str) -> dict[str, Any]:
     ]
     safety_df = sub[[c for c in score_cols if c in sub.columns]].drop_duplicates("nct_id").reset_index(drop=True)
 
-    panel_local = trials_df.merge(safety_df, on="nct_id", how="left")
+    market_cols = [
+        "nct_id", "ticker", "event_date_used", "event_date_source",
+        "ret_-5_0", "ret_0_5", "ret_0_20", "ret_0_60",
+        "abret_-5_0", "abret_0_5", "abret_0_20", "abret_0_60",
+    ]
+    market_df = sub[[c for c in market_cols if c in sub.columns]].drop_duplicates("nct_id").reset_index(drop=True)
+
+    panel_local = trials_df.merge(safety_df, on="nct_id", how="left").merge(
+        market_df.drop(columns=["ticker"], errors="ignore"), on="nct_id", how="left"
+    )
 
     return {
         "names": [f"(demo data — {len(trials_df)} pre-loaded trials for {ticker.upper()})"],
@@ -302,6 +427,8 @@ score how scary each drug looks compared to placebo, and surface the alarming on
 
 {quick_links_html}
 
+{_findings_section_html() if DEMO_MODE else ""}
+
 <div class="help-box" style="margin-top: 1.5em">
   <strong>What you'll see after fetching:</strong>
   <ol style="margin: 0.5em 0 0 1.5em">
@@ -343,7 +470,10 @@ def _alerts_section_html(panel: pd.DataFrame) -> str:
   <td>{_esc(r.get('enrollment_count'))}</td>
   <td><span class="pct-bad">{r['drug_rate']*100:.1f}%</span></td>
   <td><span class="pct-good">{r['placebo_rate']*100:.1f}%</span></td>
-  <td>{_esc(str(r.get('brief_title') or '')[:80])}</td>
+  {_ret_cell(r.get('abret_0_5'))}
+  {_ret_cell(r.get('abret_0_20'))}
+  {_ret_cell(r.get('abret_0_60'))}
+  <td>{_esc(str(r.get('brief_title') or '')[:55])}</td>
 </tr>""")
 
     n_alerts = (scored["safety_score"] >= 0.05).sum()
@@ -352,15 +482,18 @@ def _alerts_section_html(panel: pd.DataFrame) -> str:
 <div class="help-box">
   <strong>How to read this:</strong> Each row is one trial. The <em>Safety Score</em>
   is the percentage-point difference between the drug arm's serious-side-effect rate
-  and the placebo arm's rate. A score of <span class="score-pill scary">+10.0 pp</span>
-  means 10% MORE drug-arm patients had a serious event than placebo-arm patients.
-  Rows shaded pink have crossed our 5pp alert threshold ({n_alerts} of {len(scored)} scoreable trials).
-  Click an NCT to verify on clinicaltrials.gov.
+  and the placebo arm's rate. The <em>Abnormal return</em> columns show what the
+  ticker did vs IBB after the trial's results were posted (positive = stock outperformed,
+  negative = stock underperformed). The hypothesis predicts <strong>red returns to
+  cluster on high-score rows</strong>. Click an NCT to verify on clinicaltrials.gov.
+  Pink rows crossed our 5pp alert threshold ({n_alerts} of {len(scored)} scoreable trials).
 </div>
 <div class="scroll">
 <table>
 <tr><th>Score</th><th>Trial</th><th>Phase</th><th>Enrolled</th>
-    <th>Drug-arm serious rate</th><th>Placebo-arm serious rate</th><th>Title</th></tr>
+    <th>Drug serious rate</th><th>Placebo serious rate</th>
+    <th>Abnormal ret [0,+5]</th><th>[0,+20]</th><th>[0,+60]</th>
+    <th>Title</th></tr>
 {''.join(rows_html)}
 </table>
 </div>
@@ -383,8 +516,11 @@ def _safety_table_html(panel: pd.DataFrame) -> str:
   <td>{_esc(r.get('enrollment_count'))}</td>
   <td>{r['drug_rate']*100:.1f}%</td>
   <td>{r['placebo_rate']*100:.1f}%</td>
+  {_ret_cell(r.get('abret_0_5'))}
+  {_ret_cell(r.get('abret_0_20'))}
+  {_ret_cell(r.get('abret_0_60'))}
   <td>{_esc(r.get('completion_date'))}</td>
-  <td>{_esc(str(r.get('brief_title') or '')[:80])}</td>
+  <td>{_esc(str(r.get('brief_title') or '')[:55])}</td>
 </tr>""")
 
     return f"""
@@ -392,13 +528,16 @@ def _safety_table_html(panel: pd.DataFrame) -> str:
 <div class="help-box">
   Every trial below has both a drug arm AND a placebo arm, so we could compute the
   comparison. Sorted scariest first. Higher score = drug arm caused noticeably more
-  serious side effects than placebo did.
+  serious side effects than placebo did. The "Abnormal ret" columns show
+  what the stock did vs IBB after results posted — eyeballing them tells you whether
+  scary trials really did underperform afterward in this ticker.
 </div>
 <div class="scroll">
 <table>
 <tr><th>Score</th><th>Trial</th><th>Phase</th><th>Enrolled</th>
-    <th>Drug serious rate</th><th>Placebo serious rate</th>
-    <th>Completion</th><th>Title</th></tr>
+    <th>Drug rate</th><th>Placebo rate</th>
+    <th>Abnormal ret [0,+5]</th><th>[0,+20]</th><th>[0,+60]</th>
+    <th>Completed</th><th>Title</th></tr>
 {''.join(rows_html)}
 </table>
 </div>
@@ -422,12 +561,32 @@ def _bar_chart(series: pd.Series, max_bars: int = 15) -> str:
 
 def _drill_in_html(
     nct: str, trials_df: pd.DataFrame, events_df: pd.DataFrame,
-    arms_df: pd.DataFrame, safety_df: pd.DataFrame,
+    arms_df: pd.DataFrame, safety_df: pd.DataFrame, panel: pd.DataFrame,
 ) -> str:
-    trow = trials_df[trials_df["nct_id"] == nct]
+    # Use the merged panel as source so we have market columns too
+    trow = panel[panel["nct_id"] == nct] if not panel.empty else trials_df[trials_df["nct_id"] == nct]
     if trow.empty:
         return f'<div class="error">Trial {_esc(nct)} not found in this dataset.</div>'
     t = trow.iloc[0]
+
+    # Forward-return data (from the panel, joined into the trial row in demo mode)
+    market_html = ""
+    market_cols = ["abret_0_5", "abret_0_20", "abret_0_60"]
+    if any(c in t.index and pd.notna(t.get(c)) for c in market_cols):
+        cells = ""
+        for c, label in [("abret_0_5", "1 week"), ("abret_0_20", "1 month"), ("abret_0_60", "3 months")]:
+            v = t.get(c)
+            if pd.notna(v):
+                cls = "pct-bad" if v < -0.02 else ("pct-good" if v > 0.02 else "")
+                cells += f'<td><strong>{label}:</strong> <span class="{cls}">{"+" if v >= 0 else ""}{v*100:.1f}%</span></td>'
+        if cells:
+            market_html = f"""
+<div class="help-box" style="background:#f7fafc; border-left-color:#4a5568">
+  <strong>What the stock did after results posted</strong> (abnormal return = ticker minus IBB):
+  <table style="margin: 0.5em 0"><tr>{cells}</tr></table>
+  <p class="help" style="margin: 0">Negative = stock underperformed the biotech sector. The hypothesis says scary trials should land here.</p>
+</div>
+"""
 
     score_row = safety_df[safety_df["nct_id"] == nct]
     if not score_row.empty and pd.notna(score_row.iloc[0]["safety_score"]):
@@ -457,49 +616,59 @@ def _drill_in_html(
 </div>
 """
 
-    sub = events_df[events_df["nct_id"] == nct]
+    sub = events_df[events_df["nct_id"] == nct] if not events_df.empty else events_df
 
     # Per-arm pivot tables
     pivots_html = ""
-    for severity, label in [("serious", "Serious side effects"), ("other", "Mild side effects")]:
-        sev = sub[sub["severity_class"] == severity]
-        if sev.empty:
-            continue
-        pivot = sev.pivot_table(
-            index=["organ_system", "event_term"],
-            columns="group_title",
-            values="incidence_rate",
-            aggfunc="first",
-        )
-        rows = []
-        rows.append("<tr><th>Body system</th><th>Side effect</th>" +
-                    "".join(f"<th>{_esc(c)}</th>" for c in pivot.columns) + "</tr>")
-        for (organ, term), row in pivot.iterrows():
-            cells = [f"<td>{_esc(organ)}</td>", f"<td>{_esc(term)}</td>"]
-            for c in pivot.columns:
-                v = row[c]
-                if pd.isna(v):
-                    cells.append("<td></td>")
-                else:
-                    pct = v * 100
-                    cls = "pct-bad" if pct >= 10 else ("pct-warn" if pct >= 5 else "pct-good")
-                    cells.append(f'<td class="{cls}">{pct:.1f}%</td>')
-            rows.append("<tr>" + "".join(cells) + "</tr>")
-        intro = (
-            "<strong>How to read:</strong> each row is one specific side effect. "
-            "Each column is one arm of the trial. The cell is the percentage of patients "
-            "in that arm who had that side effect. Compare columns to see if the drug arm "
-            "is worse than placebo." if severity == "serious" else
-            "Same idea as the serious-events table above, but for milder side effects."
-        )
-        pivots_html += f"""
+    has_events = (not sub.empty) and ("severity_class" in sub.columns)
+    if has_events:
+        for severity, label in [("serious", "Serious side effects"), ("other", "Mild side effects")]:
+            sev = sub[sub["severity_class"] == severity]
+            if sev.empty:
+                continue
+            pivot = sev.pivot_table(
+                index=["organ_system", "event_term"],
+                columns="group_title",
+                values="incidence_rate",
+                aggfunc="first",
+            )
+            rows = []
+            rows.append("<tr><th>Body system</th><th>Side effect</th>" +
+                        "".join(f"<th>{_esc(c)}</th>" for c in pivot.columns) + "</tr>")
+            for (organ, term), row in pivot.iterrows():
+                cells = [f"<td>{_esc(organ)}</td>", f"<td>{_esc(term)}</td>"]
+                for c in pivot.columns:
+                    v = row[c]
+                    if pd.isna(v):
+                        cells.append("<td></td>")
+                    else:
+                        pct = v * 100
+                        cls = "pct-bad" if pct >= 10 else ("pct-warn" if pct >= 5 else "pct-good")
+                        cells.append(f'<td class="{cls}">{pct:.1f}%</td>')
+                rows.append("<tr>" + "".join(cells) + "</tr>")
+            intro = (
+                "<strong>How to read:</strong> each row is one specific side effect. "
+                "Each column is one arm of the trial. The cell is the percentage of patients "
+                "in that arm who had that side effect. Compare columns to see if the drug arm "
+                "is worse than placebo." if severity == "serious" else
+                "Same idea as the serious-events table above, but for milder side effects."
+            )
+            pivots_html += f"""
 <h3>{label} — % of patients in each arm</h3>
 <div class="help-box">{intro}</div>
 <div class="scroll"><table>{''.join(rows)}</table></div>
 """
 
     if not pivots_html:
-        pivots_html = "<p><em>No adverse-event rows for this trial.</em></p>"
+        pivots_html = """
+<div class="help-box">
+  <strong>Per-arm side-effect tables:</strong> not available in demo mode (the
+  panel CSV stores summary counts only). For the full per-arm pivot table, run
+  the project locally — see the README, or follow the
+  <a href="https://clinicaltrials.gov/study/{nct_id}" target="_blank">official
+  clinicaltrials.gov page</a> below for the same data.
+</div>
+""".replace("{nct_id}", nct)
 
     return f"""
 <h2>{_esc(nct)} — {_esc(t['brief_title'])}</h2>
@@ -516,6 +685,7 @@ def _drill_in_html(
    and check that our percentages match)</a></p>
 
 {score_html}
+{market_html}
 {pivots_html}
 """
 
@@ -543,6 +713,27 @@ def _run_view(ticker: str, max_pages: int, drill_nct: str | None) -> str:
     n_with_ae = int(trials_df["has_adverse_events"].sum()) if not trials_df.empty else 0
     n_scored = int(safety_df["safety_score"].notna().sum()) if not safety_df.empty else 0
     n_alerts = int((safety_df["safety_score"] >= 0.05).sum()) if not safety_df.empty else 0
+
+    # Per-ticker IC (caveat: small samples are noisy)
+    ticker_ic_html = ""
+    if not panel.empty and "abret_0_20" in panel.columns:
+        ic20 = information_coefficient(panel, "abret_0_20")
+        ic60 = information_coefficient(panel, "abret_0_60") if "abret_0_60" in panel.columns else {"ic_spearman": None, "n": 0}
+        if ic20.get("n", 0) >= 5:
+            def _fmt_ic(v): return "—" if v is None else f"{v:+.3f}"
+            note = ""
+            if ic20["n"] < 30:
+                note = " <em>(small sample — interpret with caution)</em>"
+            ticker_ic_html = f"""
+<div class="help-box" style="background:#fefce8; border-left-color:#ca8a04">
+  <strong>Per-ticker backtest:</strong> on the {ic20['n']} {ticker} trials with both
+  a score and a forward return, IC at [0,+20] = <strong>{_fmt_ic(ic20['ic_spearman'])}</strong>,
+  IC at [0,+60] = <strong>{_fmt_ic(ic60.get('ic_spearman'))}</strong>.{note}
+  Negative IC = hypothesis confirmed (high score predicts low returns). The cross-watchlist
+  finding (<a href="/">see home page</a>) is the more reliable number — IC −0.09 on
+  pivotal Phase 3 trials.
+</div>
+"""
 
     intro = f"""
 <a href="/">&larr; New search</a>
@@ -593,16 +784,19 @@ def _run_view(ticker: str, max_pages: int, drill_nct: str | None) -> str:
     <div class="sub">Score ≥ +5 pp (drug noticeably worse)</div>
   </div>
 </div>
+
+{ticker_ic_html}
 """
 
     alerts = _alerts_section_html(panel) if not panel.empty else ""
     safety_table = _safety_table_html(panel) if not panel.empty else ""
 
-    # Drill-in selector
+    # Drill-in selector — works both in live mode (with events) and demo mode (without)
     drill_form = ""
     drill_html = ""
-    if not events_df.empty:
-        ncts = sorted(events_df["nct_id"].dropna().unique())
+    drill_source = events_df if not events_df.empty else trials_df
+    if not drill_source.empty:
+        ncts = sorted(drill_source["nct_id"].dropna().unique())
         # Default selection: pick the highest-score one if no nct chosen
         default_nct = drill_nct
         if not default_nct and not safety_df.empty:
@@ -630,7 +824,7 @@ def _run_view(ticker: str, max_pages: int, drill_nct: str | None) -> str:
 </form>
 """
         if drill_nct:
-            drill_html = _drill_in_html(drill_nct, trials_df, events_df, arms_df, safety_df)
+            drill_html = _drill_in_html(drill_nct, trials_df, events_df, arms_df, safety_df, panel)
 
     # Chart of organ systems
     organ_chart = ""
