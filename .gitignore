@@ -1,0 +1,30 @@
+# Secrets
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# Data — keep analytical artifacts, drop bulky raw payloads
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/safety_panel.csv
+data/cache/watcher/seen_ncts.txt
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: biopharma-trial-explorer
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: BIND_HOST
+        value: "0.0.0.0"
+      - key: AUTO_OPEN_BROWSER
+        value: "0"
+    plan: free
+    region: oregon
