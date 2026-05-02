@@ -21,6 +21,12 @@ from urllib.parse import parse_qs, urlparse
 import pandas as pd
 
 from src.backtest import information_coefficient, quantile_buckets
+from src.comparator import (
+    alternatives_for_condition,
+    alternatives_for_drug,
+    build_drug_condition_index,
+    search as comparator_search,
+)
 from src.data_cleaner import flatten, flatten_arms
 from src.data_fetcher import (
     fetch_completed_trials_for_sponsors,
@@ -418,8 +424,26 @@ def _home_view() -> str:
 
     body = f"""
 <h1>Biopharma Trial Safety Explorer</h1>
-<p class="subtitle">Type a US biopharma ticker. We'll show every completed clinical trial,
-score how scary each drug looks compared to placebo, and surface the alarming ones.</p>
+<p class="subtitle">Two views over the same dataset. <strong>Investor view</strong>: pick a
+ticker, see its trials and how the stock reacted to each readout. <strong>Doctor view</strong>:
+pick a condition or drug, compare safety profiles across competitor drugs.</p>
+
+<div style="display: flex; gap: 1em; margin: 1.5em 0; flex-wrap: wrap">
+  <a href="#investor" style="flex:1; min-width: 280px; background:#2b6cb0; color:white;
+     padding: 1.2em 1.5em; border-radius:8px; text-decoration:none">
+    <strong>Investor view &rarr;</strong><br>
+    <span style="font-size: 0.9em; opacity: 0.9">By ticker. Trial-by-trial safety scores plus the
+    forward stock-return backtest.</span>
+  </a>
+  <a href="/compare" style="flex:1; min-width: 280px; background:#38a169; color:white;
+     padding: 1.2em 1.5em; border-radius:8px; text-decoration:none">
+    <strong>Doctor view &rarr;</strong><br>
+    <span style="font-size: 0.9em; opacity: 0.9">By condition or drug. Rank competing drugs by
+    safety profile across all sponsors.</span>
+  </a>
+</div>
+
+<h2 id="investor">Investor view — pick a ticker</h2>
 
 {demo_note}
 
@@ -844,6 +868,155 @@ def _run_view(ticker: str, max_pages: int, drill_nct: str | None) -> str:
     return _page(f"{ticker} - Trial Safety Dashboard", body)
 
 
+# ============================== comparator (Part 2) =========================
+
+# Cached drug-vs-condition index
+_DRUG_INDEX: pd.DataFrame | None = None
+
+
+def _load_drug_index() -> pd.DataFrame:
+    """Build (and cache) the (drug, condition) -> aggregated safety index."""
+    global _DRUG_INDEX
+    if _DRUG_INDEX is None:
+        panel = _load_demo_panel() if DEMO_MODE else None
+        if panel is None or panel.empty:
+            _DRUG_INDEX = pd.DataFrame()
+        else:
+            _DRUG_INDEX = build_drug_condition_index(panel)
+    return _DRUG_INDEX
+
+
+def _compare_view(query: str, by: str) -> str:
+    """Render the doctor-facing /compare page."""
+    index = _load_drug_index()
+
+    if index.empty:
+        return _page("Compare", """
+<a href="/">&larr; back</a>
+<h1>Drug Comparator</h1>
+<div class="error">No comparison data available. Run <code>python -m src.build_panel</code> first.</div>
+""")
+
+    # Search form (always shown)
+    form = f"""
+<form method="get" action="/compare">
+  <div>
+    <label>Condition or drug name</label>
+    <input type="text" name="q" value="{_esc(query)}" placeholder="e.g., diabetes, pembrolizumab, lung cancer" required style="width: 320px">
+    <div class="help">Type a disease (find drugs tested for it) or a drug name (find similar competitor drugs).</div>
+  </div>
+  <div>
+    <label>Search by</label>
+    <select name="by">
+      <option value="auto"{" selected" if by=="auto" else ""}>Auto (either)</option>
+      <option value="condition"{" selected" if by=="condition" else ""}>Condition</option>
+      <option value="drug"{" selected" if by=="drug" else ""}>Drug</option>
+    </select>
+  </div>
+  <button type="submit">Compare</button>
+</form>
+"""
+
+    intro = f"""
+<a href="/">&larr; home</a>
+<h1>Drug Safety Comparator</h1>
+<p class="subtitle">Pick a condition to see all drugs tested for it (ranked by safety profile),
+or pick a drug to see its competitors. Powered by the same dataset as the per-ticker view —
+just pivoted from "company" to "drug class".</p>
+
+<div class="warn-box">
+  <strong>Definition of "best":</strong> on this page, the drug with the lowest safety score
+  is "cleanest" — i.e., its drug arm caused the smallest excess of serious side effects vs
+  placebo, averaged across all trials. This does NOT measure efficacy, cost, or
+  patient-specific factors. It's a safety-only signal, not a clinical recommendation.
+</div>
+
+{form}
+"""
+
+    if not query:
+        # Empty state — show some popular conditions to seed the doctor's exploration
+        popular_conds = (
+            index.groupby("condition_label")["n_scored"].sum()
+            .sort_values(ascending=False).head(15)
+        )
+        cond_chips = "".join(
+            f'<a href="/compare?q={_esc(c)}&by=condition" '
+            f'style="display:inline-block;padding:0.4em 0.8em;margin:0.2em;'
+            f'background:#edf2f7;border-radius:4px;text-decoration:none;color:#2d3748">'
+            f'{_esc(c)} ({int(n)})</a>'
+            for c, n in popular_conds.items() if c
+        )
+        return _page("Compare", intro + f"""
+<h2>Try a popular condition</h2>
+<p class="help">(Number = how many scored trials we have for that condition across all 10 watchlist tickers.)</p>
+<div>{cond_chips}</div>
+""")
+
+    # Run the search depending on `by`
+    if by == "drug":
+        results = alternatives_for_drug(index, query, min_trials=1)
+        title = f"Competitors for drugs matching “{_esc(query)}”"
+    elif by == "condition":
+        results = alternatives_for_condition(index, query, min_trials=1)
+        title = f"Drugs tested for conditions matching “{_esc(query)}”"
+    else:  # auto
+        # Try condition first, fall back to drug if no condition matches
+        results = alternatives_for_condition(index, query, min_trials=1)
+        title = f"Drugs tested for conditions matching “{_esc(query)}”"
+        if results.empty:
+            results = alternatives_for_drug(index, query, min_trials=1)
+            title = f"Competitors for drugs matching “{_esc(query)}”"
+
+    if results.empty:
+        return _page("Compare", intro + f"""
+<h2>No matches</h2>
+<p>Nothing in our dataset matches “{_esc(query)}”. Try one of the popular conditions
+on the <a href="/compare">main compare page</a>, or use a different search term.</p>
+""")
+
+    # Render results, grouped by condition for readability
+    rows_html = []
+    for cond, group in results.groupby("condition_label", dropna=False):
+        # Sort each condition's drugs by weighted safety score (cleanest first)
+        group_sorted = group.sort_values(
+            ["weighted_score", "n_trials"], ascending=[True, False], na_position="last"
+        )
+        rows_html.append(f'<tr style="background:#f7fafc"><th colspan="6" style="text-align:left">'
+                         f'{_esc(cond)} &nbsp; <span class="help" style="font-weight:normal">'
+                         f'({len(group_sorted)} drug(s) tested)</span></th></tr>')
+        for _, r in group_sorted.iterrows():
+            score = r["weighted_score"]
+            score_html = _score_pill(score)
+            rows_html.append(f"""
+<tr>
+  <td>{score_html}</td>
+  <td><strong>{_esc(r['drug_label'])}</strong></td>
+  <td>{int(r['n_trials'])}</td>
+  <td>{int(r['n_scored'])}</td>
+  <td>{_esc(r.get('sponsors',''))[:80]}</td>
+  <td>{_esc(r.get('tickers',''))}</td>
+</tr>""")
+
+    table_html = f"""
+<h2>{title}</h2>
+<div class="help-box">
+  <strong>How to read:</strong> rows are grouped by condition. Within each group, drugs are
+  ranked from <em>cleanest</em> (lowest weighted safety score, top) to <em>scariest</em>
+  (highest, bottom). Score is enrollment-weighted across all trials we have for that
+  drug-condition pair.
+</div>
+<div class="scroll">
+<table>
+<tr><th>Score</th><th>Drug</th><th>Total trials</th><th>Scoreable trials</th>
+    <th>Sponsors</th><th>Watchlist tickers</th></tr>
+{''.join(rows_html)}
+</table>
+</div>
+"""
+    return _page("Compare", intro + table_html)
+
+
 # ============================== HTTP =========================================
 
 class Handler(BaseHTTPRequestHandler):
@@ -862,6 +1035,14 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         if url.path == "/":
             self._send(_home_view())
+            return
+        if url.path == "/compare":
+            params = parse_qs(url.query)
+            q = (params.get("q", [""])[0] or "").strip()
+            by = (params.get("by", ["auto"])[0] or "auto").strip().lower()
+            if by not in ("auto", "drug", "condition"):
+                by = "auto"
+            self._send(_compare_view(q, by))
             return
         if url.path == "/run":
             params = parse_qs(url.query)

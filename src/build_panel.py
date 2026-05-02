@@ -59,6 +59,8 @@ def build_for_ticker(ticker: str, max_pages: int | None) -> pd.DataFrame:
     keep_trial_cols = [
         "nct_id", "brief_title", "lead_sponsor", "phase", "study_type",
         "enrollment_count", "conditions", "intervention_names",
+        "condition_mesh_ids", "condition_mesh_terms",
+        "intervention_mesh_ids", "intervention_mesh_terms",
         "completion_date", "results_first_posted",
         "has_adverse_events", "n_arms",
     ]

@@ -45,10 +45,24 @@ def _safe_get(d: dict[str, Any], *keys: str, default: Any = None) -> Any:
     return cur
 
 
+def _extract_mesh_terms(meshes: list[dict[str, Any]] | None) -> tuple[str | None, str | None]:
+    """From a CT.gov mesh list, return (`pipe-joined IDs`, `pipe-joined terms`).
+
+    Each entry looks like ``{"id": "D003920", "term": "Diabetes Mellitus, Type 2"}``.
+    Standardised IDs are what we group on; terms are for display / search.
+    """
+    if not meshes:
+        return None, None
+    ids = [m.get("id", "") for m in meshes if m.get("id")]
+    terms = [m.get("term", "") for m in meshes if m.get("term")]
+    return ("|".join(ids) or None), ("|".join(terms) or None)
+
+
 def extract_trial_metadata(study: dict[str, Any]) -> dict[str, Any]:
     """Return one flat dict of headline fields for a single study."""
     ps = study.get("protocolSection", {})
     rs = study.get("resultsSection", {})
+    ds = study.get("derivedSection", {})
 
     ident = ps.get("identificationModule", {})
     status = ps.get("statusModule", {})
@@ -72,6 +86,17 @@ def extract_trial_metadata(study: dict[str, Any]) -> dict[str, Any]:
     conditions = cond_mod.get("conditions") or []
     condition_str = "|".join(conditions) if conditions else None
 
+    # MeSH (Medical Subject Headings) — the standardised vocabulary that lets us
+    # group "MK-3475", "pembrolizumab", and "Keytruda" as the same drug, and
+    # "Type 2 Diabetes" / "T2DM" as the same condition. CT.gov auto-classifies
+    # most trials. Coverage isn't 100% but where present the IDs are canonical.
+    cond_mesh_ids, cond_mesh_terms = _extract_mesh_terms(
+        _safe_get(ds, "conditionBrowseModule", "meshes")
+    )
+    interv_mesh_ids, interv_mesh_terms = _extract_mesh_terms(
+        _safe_get(ds, "interventionBrowseModule", "meshes")
+    )
+
     ae_mod = rs.get("adverseEventsModule") or {}
 
     return {
@@ -91,6 +116,10 @@ def extract_trial_metadata(study: dict[str, Any]) -> dict[str, Any]:
         "conditions": condition_str,
         "intervention_names": intervention_names,
         "intervention_types": intervention_types,
+        "condition_mesh_ids": cond_mesh_ids,
+        "condition_mesh_terms": cond_mesh_terms,
+        "intervention_mesh_ids": interv_mesh_ids,
+        "intervention_mesh_terms": interv_mesh_terms,
         "has_results": bool(rs),
         "has_adverse_events": bool(ae_mod),
         "n_arms": len(ae_mod.get("eventGroups") or []),
