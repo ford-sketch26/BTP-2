@@ -5,9 +5,18 @@ The Part-1 unit of analysis is "one trial". The doctor's unit of analysis is
 sitagliptin / empagliflozin / saxagliptin has the cleanest safety profile?"
 
 This module pivots the panel:
-  * group trials by (intervention_mesh_id, condition_mesh_id)
-  * aggregate safety scores across all trials in the group
+  * group trials by (intervention_mesh_id, condition_mesh_id, phase_scope)
+  * aggregate safety scores across trials in the group
   * provide search by condition or drug name (raw or MeSH term)
+
+Two phase scopes are computed in parallel for every drug-condition pair:
+  * "pivotal" — only Phase 3 and Phase 4 trials. The default view; matches
+    the slice where Part-1's backtest showed IC = -0.09. Cleaner populations,
+    larger samples, mostly placebo-controlled designs.
+  * "all"     — every phase, including Phase 1 dose-finding. Useful for early
+    pipeline drugs where pivotal data doesn't exist yet, but mixes very
+    different patient populations and trial designs (Phase 1 oncology trials
+    have inherently high raw event rates regardless of drug).
 
 MeSH (Medical Subject Headings) is the National Library of Medicine's
 standardised vocabulary. Pulling MeSH IDs from CT.gov dedupes drug names
@@ -96,6 +105,7 @@ def _explode_pairs(panel: pd.DataFrame) -> pd.DataFrame:
                     "ticker": t.get("ticker"),
                     "lead_sponsor": t.get("lead_sponsor"),
                     "phase": t.get("phase"),
+                    "is_pivotal": _is_pivotal_phase(t.get("phase")),
                     "enrollment_count": t.get("enrollment_count"),
                     "completion_date": t.get("completion_date"),
                     "drug_key": dkey,
@@ -113,6 +123,17 @@ def _explode_pairs(panel: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+_PIVOTAL_PHASES = {"PHASE3", "PHASE4", "PHASE2|PHASE3", "PHASE3|PHASE4"}
+
+
+def _is_pivotal_phase(phase: object) -> bool:
+    """A trial counts as 'pivotal' if its phase string contains PHASE3 or PHASE4."""
+    if phase is None or (isinstance(phase, float) and pd.isna(phase)):
+        return False
+    p = str(phase).strip().upper()
+    return p in _PIVOTAL_PHASES or "PHASE3" in p or "PHASE4" in p
+
+
 def build_drug_condition_index(panel: pd.DataFrame) -> pd.DataFrame:
     """Aggregate the panel into one row per (drug, condition) pair.
 
@@ -125,50 +146,72 @@ def build_drug_condition_index(panel: pd.DataFrame) -> pd.DataFrame:
     if exploded.empty:
         return pd.DataFrame()
 
-    def _agg(g: pd.DataFrame) -> pd.Series:
+    def _phase_breakdown(g: pd.DataFrame) -> str:
+        """Compact human-readable phase distribution: e.g. '5 P3, 2 P2, 1 P1'."""
+        if g.empty:
+            return ""
+        counts: dict[str, int] = {}
+        for p in g["phase"].fillna("(none)"):
+            label = "P4" if "PHASE4" in p else (
+                "P3" if "PHASE3" in p else (
+                "P2" if "PHASE2" in p else (
+                "P1" if "PHASE1" in p else "?")))
+            counts[label] = counts.get(label, 0) + 1
+        order = ["P4", "P3", "P2", "P1", "?"]
+        return ", ".join(f"{counts[p]} {p}" for p in order if p in counts and counts[p] > 0)
+
+    def _scope_aggregates(g: pd.DataFrame, prefix: str) -> dict:
+        """Compute weighted_score, pooled_drug_rate, totals for one phase scope."""
         scored = g.dropna(subset=["safety_score"])
         with_drug_rate = g.dropna(subset=["drug_rate"])
-        drug_label = g["drug_label"].mode().iloc[0] if not g["drug_label"].empty else ""
-        cond_label = g["condition_label"].mode().iloc[0] if not g["condition_label"].empty else ""
 
-        # Enrollment-weighted safety score (drug minus placebo) — only when placebo data present
         if not scored.empty:
             weights = scored["enrollment_count"].fillna(1).clip(lower=1)
-            weighted_score = float((scored["safety_score"] * weights).sum() / weights.sum())
-            mean_score = float(scored["safety_score"].mean())
+            ws = float((scored["safety_score"] * weights).sum() / weights.sum())
+            ms = float(scored["safety_score"].mean())
         else:
-            weighted_score = None
-            mean_score = None
+            ws, ms = None, None
 
-        # Pooled drug-arm serious-event rate — computable for ANY trial with arm data,
-        # including single-arm trials that don't get a safety score. Pool affected+at_risk
-        # across all NCTs in the (drug × condition) group so big trials weight more naturally.
         if not with_drug_rate.empty:
             d_at_risk = float(with_drug_rate["drug_at_risk"].fillna(0).sum())
             d_affected = float(with_drug_rate["drug_affected"].fillna(0).sum())
-            pooled_drug_rate = d_affected / d_at_risk if d_at_risk > 0 else None
+            pdr = d_affected / d_at_risk if d_at_risk > 0 else None
         else:
-            pooled_drug_rate = None
-            d_at_risk = 0.0
-            d_affected = 0.0
+            pdr = None
+            d_at_risk = d_affected = 0.0
+
+        return {
+            f"{prefix}_n_trials": len(g),
+            f"{prefix}_n_scored": len(scored),
+            f"{prefix}_weighted_score": ws,
+            f"{prefix}_mean_score": ms,
+            f"{prefix}_pooled_drug_rate": pdr,
+            f"{prefix}_drug_at_risk_total": int(d_at_risk),
+            f"{prefix}_drug_affected_total": int(d_affected),
+        }
+
+    def _agg(g: pd.DataFrame) -> pd.Series:
+        drug_label = g["drug_label"].mode().iloc[0] if not g["drug_label"].empty else ""
+        cond_label = g["condition_label"].mode().iloc[0] if not g["condition_label"].empty else ""
+
+        # Two parallel aggregations: "all" (every phase) and "pivotal" (Phase 3/4 only).
+        all_aggs = _scope_aggregates(g, "all")
+        pivotal_aggs = _scope_aggregates(g[g["is_pivotal"]], "pivotal")
 
         sponsors = sorted({s for s in g["lead_sponsor"].dropna().unique() if s})
         tickers = sorted({t for t in g["ticker"].dropna().unique() if t})
 
-        return pd.Series({
+        out = {
             "drug_label": drug_label,
             "condition_label": cond_label,
             "n_trials": len(g),
-            "n_scored": len(scored),
-            "n_with_drug_rate": len(with_drug_rate),
-            "mean_score": mean_score,
-            "weighted_score": weighted_score,
-            "pooled_drug_rate": pooled_drug_rate,
-            "drug_at_risk_total": int(d_at_risk),
-            "drug_affected_total": int(d_affected),
+            "phase_breakdown": _phase_breakdown(g),
             "sponsors": ", ".join(sponsors),
             "tickers": ", ".join(tickers),
-        })
+        }
+        out.update(all_aggs)
+        out.update(pivotal_aggs)
+        return pd.Series(out)
 
     grouped = (
         exploded.groupby(["drug_key", "condition_key"], dropna=False)
@@ -207,21 +250,35 @@ def search(
     return index[combined].copy()
 
 
+def _scope_score_col(scope: str) -> str:
+    return "pivotal_weighted_score" if scope == "pivotal" else "all_weighted_score"
+
+
+def _scope_n_col(scope: str) -> str:
+    return "pivotal_n_trials" if scope == "pivotal" else "all_n_trials"
+
+
 def alternatives_for_drug(
     index: pd.DataFrame, drug_query: str, min_trials: int = 1,
+    phase_scope: str = "pivotal",
 ) -> pd.DataFrame:
     """Given a drug name, find conditions it's tested for and *competing* drugs
     tested for those same conditions, ranked by safety score.
+
+    ``phase_scope`` is "pivotal" (Phase 3/4 only — the default) or "all".
+    Drugs without trials in the chosen scope are excluded.
     """
     matches = search(index, drug_query, by="drug")
     if matches.empty:
         return pd.DataFrame()
+    n_col = _scope_n_col(phase_scope)
+    score_col = _scope_score_col(phase_scope)
     relevant_conditions = matches["condition_key"].unique()
     competitors = index[
         (index["condition_key"].isin(relevant_conditions))
-        & (index["n_trials"] >= min_trials)
+        & (index[n_col] >= min_trials)
     ].copy()
-    return competitors.sort_values(["condition_label", "weighted_score"], na_position="last")
+    return competitors.sort_values(["condition_label", score_col], na_position="last")
 
 
 def alternatives_for_condition(
@@ -229,32 +286,38 @@ def alternatives_for_condition(
     condition_query: str,
     min_trials: int = 1,
     exact_label: str | None = None,
+    phase_scope: str = "pivotal",
 ) -> pd.DataFrame:
-    """Given a condition, return all drugs tested for it, ranked by safety score (cleanest first).
+    """Given a condition, return drugs tested for it, ranked by safety score.
 
-    If ``exact_label`` is provided, restrict to rows whose ``condition_label`` matches
-    it exactly (case-insensitive). Useful for the "narrow to specific condition" UI.
+    ``phase_scope`` is "pivotal" (Phase 3/4 only) or "all". Drugs without
+    trials in the chosen scope are excluded — this is the "fairness" guard:
+    a drug that only has Phase 1 data won't appear in the pivotal view.
     """
     matches = search(index, condition_query, by="condition")
     if matches.empty:
         return pd.DataFrame()
     if exact_label:
         matches = matches[matches["condition_label"].fillna("").str.lower() == exact_label.lower()]
-    matches = matches[matches["n_trials"] >= min_trials]
-    return matches.sort_values(["weighted_score", "n_trials"], ascending=[True, False], na_position="last")
+    n_col = _scope_n_col(phase_scope)
+    score_col = _scope_score_col(phase_scope)
+    matches = matches[matches[n_col] >= min_trials]
+    return matches.sort_values([score_col, n_col], ascending=[True, False], na_position="last")
 
 
-def list_distinct_conditions(matches: pd.DataFrame) -> pd.DataFrame:
+def list_distinct_conditions(matches: pd.DataFrame, phase_scope: str = "pivotal") -> pd.DataFrame:
     """For a result set, summarise the distinct conditions present (label + counts).
 
     Returned columns: ``condition_label``, ``n_drugs``, ``n_trials``.
     Sorted by ``n_trials`` descending so most-evidence-rich conditions surface first.
+    ``phase_scope`` decides whether to count pivotal-only or all-phase trials.
     """
     if matches.empty:
         return pd.DataFrame(columns=["condition_label", "n_drugs", "n_trials"])
+    n_col = _scope_n_col(phase_scope)
     g = (
         matches.groupby("condition_label", dropna=False)
-        .agg(n_drugs=("drug_key", "nunique"), n_trials=("n_trials", "sum"))
+        .agg(n_drugs=("drug_key", "nunique"), n_trials=(n_col, "sum"))
         .reset_index()
         .sort_values("n_trials", ascending=False)
     )

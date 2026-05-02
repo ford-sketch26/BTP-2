@@ -902,42 +902,53 @@ def _rate_pill(rate: float | None) -> str:
     return f'<span class="score-pill {cls}">{pct:.1f}%</span>'
 
 
-def _scored_table_html(group: pd.DataFrame) -> str:
-    """Drugs in this condition with placebo-comparison data — the primary ranking."""
+def _scored_table_html(group: pd.DataFrame, scope: str) -> str:
+    """Drugs with placebo-comparison data, in the chosen phase scope."""
+    score_col = "pivotal_weighted_score" if scope == "pivotal" else "all_weighted_score"
+    n_col = "pivotal_n_trials" if scope == "pivotal" else "all_n_trials"
+    scored_col = "pivotal_n_scored" if scope == "pivotal" else "all_n_scored"
     rows = []
     for _, r in group.iterrows():
         rows.append(f"""
 <tr>
-  <td>{_score_pill(r['weighted_score'])}</td>
+  <td>{_score_pill(r[score_col])}</td>
   <td><strong>{_esc(r['drug_label'])}</strong></td>
-  <td>{int(r['n_trials'])}</td>
-  <td>{int(r['n_scored'])}</td>
+  <td>{int(r[n_col])}</td>
+  <td>{int(r[scored_col])}</td>
+  <td>{_esc(r.get('phase_breakdown',''))}</td>
   <td>{_esc(r.get('sponsors',''))[:60]}</td>
   <td>{_esc(r.get('tickers',''))}</td>
 </tr>""")
     if not rows:
         return ""
+    scope_label = "Phase 3 / 4 only" if scope == "pivotal" else "all phases"
     return f"""
-<h4 style="margin-top:1em">Drugs with placebo comparison ({len(rows)})</h4>
-<p class="help">Sorted cleanest → scariest. Score = drug-arm serious-event rate minus placebo-arm rate, enrollment-weighted across all trials in the dataset.</p>
+<h4 style="margin-top:1em">Drugs with placebo comparison ({len(rows)}) &mdash; <span style="font-weight:normal;color:#4a5568">{scope_label}</span></h4>
+<p class="help">Sorted cleanest → scariest. Score = drug-arm serious-event rate minus placebo-arm rate, enrollment-weighted across the chosen scope.</p>
 <table>
-<tr><th>Safety score (vs placebo)</th><th>Drug</th>
-    <th>Trials</th><th>Scored</th><th>Sponsors</th><th>Tickers</th></tr>
+<tr><th>Safety score</th><th>Drug</th>
+    <th>Trials in scope</th><th>Scored</th><th>Phase mix (all data)</th>
+    <th>Sponsors</th><th>Tickers</th></tr>
 {''.join(rows)}
 </table>
 """
 
 
-def _limited_table_html(group: pd.DataFrame) -> str:
-    """Drugs in this condition WITHOUT a placebo comparison — show drug-arm rate only."""
+def _limited_table_html(group: pd.DataFrame, scope: str) -> str:
+    """Drugs WITHOUT a placebo comparison — show drug-arm rate only."""
+    rate_col = "pivotal_pooled_drug_rate" if scope == "pivotal" else "all_pooled_drug_rate"
+    n_col = "pivotal_n_trials" if scope == "pivotal" else "all_n_trials"
+    aff_col = "pivotal_drug_affected_total" if scope == "pivotal" else "all_drug_affected_total"
+    risk_col = "pivotal_drug_at_risk_total" if scope == "pivotal" else "all_drug_at_risk_total"
     rows = []
     for _, r in group.iterrows():
         rows.append(f"""
 <tr>
-  <td>{_rate_pill(r['pooled_drug_rate'])}</td>
+  <td>{_rate_pill(r[rate_col])}</td>
   <td><strong>{_esc(r['drug_label'])}</strong></td>
-  <td>{int(r['n_trials'])}</td>
-  <td>{int(r['drug_affected_total'])}/{int(r['drug_at_risk_total'])}</td>
+  <td>{int(r[n_col])}</td>
+  <td>{int(r[aff_col])}/{int(r[risk_col])}</td>
+  <td>{_esc(r.get('phase_breakdown',''))}</td>
   <td>{_esc(r.get('sponsors',''))[:60]}</td>
   <td>{_esc(r.get('tickers',''))}</td>
 </tr>""")
@@ -949,28 +960,28 @@ def _limited_table_html(group: pd.DataFrame) -> str:
   <strong>Read with caution.</strong> These drugs have only single-arm trials (or active-comparator
   trials) in our dataset — no placebo arm exists to subtract from the drug arm. The number shown is
   the <em>raw</em> percentage of patients in the drug arm who had at least one serious side effect.
-  This is NOT directly comparable to the safety scores in the table above, because the rate also
-  reflects how sick the patient population was (Phase 1 oncology trials always have high raw rates).
-  Use as supplementary context only.
+  Phase 1 trials in metastatic-cancer patients can have raw rates of 50% regardless of drug, simply
+  because the patients are very sick. <strong>Not directly comparable to the safety scores in the
+  table above.</strong>
 </div>
 <table>
 <tr><th>Drug-arm serious rate</th><th>Drug</th>
-    <th>Trials</th><th>Pooled patients (affected/at risk)</th>
+    <th>Trials in scope</th><th>Affected / at risk</th><th>Phase mix (all data)</th>
     <th>Sponsors</th><th>Tickers</th></tr>
 {''.join(rows)}
 </table>
 """
 
 
-def _condition_chips_html(matches: pd.DataFrame, query: str, by: str, current: str | None) -> str:
+def _condition_chips_html(matches: pd.DataFrame, query: str, by: str, current: str | None, scope: str) -> str:
     """Render refinement chips when multiple conditions match the search."""
-    distinct = list_distinct_conditions(matches)
+    distinct = list_distinct_conditions(matches, phase_scope=scope)
+    distinct = distinct[distinct["n_trials"] > 0]
     if len(distinct) <= 1:
         return ""
 
     chips = []
-    # "Any condition" reset chip
-    base_url = f"/compare?q={_esc(query)}&by={_esc(by)}"
+    base_url = f"/compare?q={_esc(query)}&by={_esc(by)}&phases={_esc(scope)}"
     is_all = current is None
     chips.append(
         f'<a href="{base_url}" style="display:inline-block;padding:0.4em 0.9em;margin:0.25em;'
@@ -1000,7 +1011,38 @@ def _condition_chips_html(matches: pd.DataFrame, query: str, by: str, current: s
 """
 
 
-def _compare_view(query: str, by: str, condition_filter: str | None = None) -> str:
+def _phase_scope_toggle_html(query: str, by: str, condition: str | None, current: str) -> str:
+    """Render the Pivotal-only / All-phases toggle."""
+    base = f"/compare?q={_esc(query)}&by={_esc(by)}"
+    if condition:
+        base += f"&condition={_esc(condition)}"
+    pivotal_active = (current == "pivotal")
+    all_active = (current == "all")
+
+    def _btn(label: str, scope: str, active: bool, hint: str) -> str:
+        return (
+            f'<a href="{base}&phases={scope}" '
+            f'style="display:inline-block;padding:0.5em 1em;margin:0.2em;'
+            f'border-radius:6px;text-decoration:none;'
+            f'background:{"#2b6cb0" if active else "#edf2f7"};'
+            f'color:{"white" if active else "#2d3748"};font-weight:600">'
+            f'{label}<br><span style="font-size:0.78em;font-weight:normal;opacity:0.85">{hint}</span></a>'
+        )
+
+    return f"""
+<div class="help-box" style="background:#f0fff4;border-left-color:#38a169">
+  <strong>Phase scope:</strong> trial phase materially changes what the safety score means.
+  Phase 3/4 = pivotal trials in the actual target population; Phase 1/2 = early-stage,
+  often dose-finding in much sicker patients. Default is pivotal-only (cleaner comparison).
+  <div style="margin-top:0.6em">
+    {_btn('Phase 3 / 4 only (recommended)', 'pivotal', pivotal_active, 'Pivotal trials, cleaner ranking')}
+    {_btn('All phases', 'all', all_active, 'Includes Phase 1/2 — more drugs, noisier scores')}
+  </div>
+</div>
+"""
+
+
+def _compare_view(query: str, by: str, condition_filter: str | None = None, phase_scope: str = "pivotal") -> str:
     """Render the doctor-facing /compare page."""
     index = _load_drug_index()
 
@@ -1066,59 +1108,78 @@ or pick a drug to see its competitors. Same dataset as the investor view — piv
 <div>{cond_chips}</div>
 """)
 
-    # Run the search depending on `by`
+    # Run the search depending on `by` and the phase scope
     if by == "drug":
-        results = alternatives_for_drug(index, query, min_trials=1)
+        results = alternatives_for_drug(index, query, min_trials=1, phase_scope=phase_scope)
         kind = "drug"
     elif by == "condition":
-        results = alternatives_for_condition(index, query, min_trials=1, exact_label=condition_filter)
+        results = alternatives_for_condition(index, query, min_trials=1, exact_label=condition_filter, phase_scope=phase_scope)
         kind = "condition"
     else:  # auto
-        results = alternatives_for_condition(index, query, min_trials=1, exact_label=condition_filter)
+        results = alternatives_for_condition(index, query, min_trials=1, exact_label=condition_filter, phase_scope=phase_scope)
         kind = "condition"
         if results.empty:
-            results = alternatives_for_drug(index, query, min_trials=1)
+            results = alternatives_for_drug(index, query, min_trials=1, phase_scope=phase_scope)
             kind = "drug"
 
+    # If the pivotal scope has zero results, hint that switching to "all phases" might help
     if results.empty:
+        # See if there's data in the wider scope
+        wider = (alternatives_for_condition(index, query, min_trials=1, exact_label=condition_filter, phase_scope="all")
+                 if by != "drug" else alternatives_for_drug(index, query, min_trials=1, phase_scope="all"))
+        hint = ""
+        if phase_scope == "pivotal" and not wider.empty:
+            hint = f"""
+<div class="warn-box">
+  Nothing matches in <strong>Phase 3 / 4 only</strong>, but {len(wider)} drug-condition pair(s)
+  exist in earlier phases. <a href="/compare?q={_esc(query)}&by={_esc(by)}{('&condition=' + _esc(condition_filter)) if condition_filter else ''}&phases=all">View all phases →</a>
+</div>
+"""
         return _page("Compare", intro + f"""
 <h2>No matches</h2>
-<p>Nothing in our dataset matches “{_esc(query)}”{' for the chosen condition' if condition_filter else ''}.
-Try a broader term or one of the popular conditions on the <a href="/compare">main compare page</a>.</p>
+{hint}
+<p>Nothing in our dataset matches “{_esc(query)}”{' for the chosen condition' if condition_filter else ''} in the current phase scope.
+Try broadening to "All phases" above, or use the <a href="/compare">main compare page</a>.</p>
 """)
 
-    # When in `auto` or `condition` mode: render condition refinement chips
+    # Phase-scope toggle (always visible once we have results)
+    toggle_html = _phase_scope_toggle_html(query, by, condition_filter, phase_scope)
+
+    # Condition refinement chips (only relevant when searching by condition)
     chips_html = ""
     if by != "drug":
-        # Re-fetch unfiltered results so the chip list shows ALL matching conditions
-        all_matches = alternatives_for_condition(index, query, min_trials=1)
+        all_matches = alternatives_for_condition(index, query, min_trials=1, phase_scope=phase_scope)
         if not all_matches.empty:
-            chips_html = _condition_chips_html(all_matches, query, by, condition_filter)
+            chips_html = _condition_chips_html(all_matches, query, by, condition_filter, phase_scope)
 
     title = (f"Drugs tested for “{_esc(condition_filter or query)}”"
              if kind == "condition"
              else f"Competitors of drugs matching “{_esc(query)}”")
 
+    # Pick column names based on scope
+    score_col = "pivotal_weighted_score" if phase_scope == "pivotal" else "all_weighted_score"
+    n_col = "pivotal_n_trials" if phase_scope == "pivotal" else "all_n_trials"
+    rate_col = "pivotal_pooled_drug_rate" if phase_scope == "pivotal" else "all_pooled_drug_rate"
+
     # Per-condition sections, each with two sub-tables (scored vs limited evidence)
     sections_html = []
     for cond, group in results.groupby("condition_label", dropna=False):
-        scored = group.dropna(subset=["weighted_score"]).sort_values(
-            ["weighted_score", "n_trials"], ascending=[True, False]
+        scored = group.dropna(subset=[score_col]).sort_values(
+            [score_col, n_col], ascending=[True, False]
         )
-        # Drugs without a safety score but with raw drug-arm rate data
-        limited = group[group["weighted_score"].isna() & group["pooled_drug_rate"].notna()].sort_values(
-            "pooled_drug_rate", ascending=True
+        limited = group[group[score_col].isna() & group[rate_col].notna()].sort_values(
+            rate_col, ascending=True
         )
 
-        scored_html = _scored_table_html(scored)
-        limited_html = _limited_table_html(limited)
+        scored_html = _scored_table_html(scored, phase_scope)
+        limited_html = _limited_table_html(limited, phase_scope)
 
         if not scored_html and not limited_html:
             continue
 
         sections_html.append(f"""
 <h3 style="background:#edf2f7;padding:0.6em 0.8em;border-radius:6px;margin-top:1.5em">
-  {_esc(cond)} <span style="font-weight:normal;color:#4a5568">— {len(group)} drug(s) tested</span>
+  {_esc(cond)} <span style="font-weight:normal;color:#4a5568">— {len(group)} drug(s)</span>
 </h3>
 {scored_html}
 {limited_html}
@@ -1126,6 +1187,7 @@ Try a broader term or one of the popular conditions on the <a href="/compare">ma
 
     body = f"""
 <h2>{title}</h2>
+{toggle_html}
 {chips_html}
 {''.join(sections_html) if sections_html else '<p><em>No drugs match the current filter.</em></p>'}
 """
@@ -1158,7 +1220,10 @@ class Handler(BaseHTTPRequestHandler):
             if by not in ("auto", "drug", "condition"):
                 by = "auto"
             condition_filter = (params.get("condition", [""])[0] or "").strip() or None
-            self._send(_compare_view(q, by, condition_filter))
+            phases = (params.get("phases", ["pivotal"])[0] or "pivotal").strip().lower()
+            if phases not in ("pivotal", "all"):
+                phases = "pivotal"
+            self._send(_compare_view(q, by, condition_filter, phases))
             return
         if url.path == "/run":
             params = parse_qs(url.query)
