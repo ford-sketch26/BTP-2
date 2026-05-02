@@ -1086,13 +1086,35 @@ or pick a drug to see its competitors. Same dataset as the investor view — piv
   patient-specific factors. <strong>Not a clinical recommendation.</strong>
 </div>
 
+<details style="margin: 0.8em 0; font-size: 0.92em">
+  <summary style="cursor: pointer; color: #4a5568">
+    <strong>How drug names and conditions are matched</strong> (click to expand)
+  </summary>
+  <div class="help-box" style="margin-top: 0.5em">
+    Drug names appear in many forms across trials — pre-market codes (<code>MK-3475</code>),
+    international names (<code>pembrolizumab</code>), and brands (<code>Keytruda</code>) are all
+    the same molecule but different strings. Same problem for conditions
+    (<code>Type 2 Diabetes</code> vs <code>T2DM</code> vs <code>Diabetes Mellitus, Type 2</code>).
+    To group competitors correctly we use <strong>MeSH</strong> (Medical Subject Headings) —
+    NLM's standardised vocabulary, where every drug and disease has one canonical ID
+    regardless of name variation. clinicaltrials.gov auto-classifies most studies with MeSH;
+    we read those IDs from the <code>derivedSection</code> of each trial's JSON.
+    Coverage is ~75%; trials without MeSH classification fall back to lowercased raw-string
+    matching. So <code>pembrolizumab</code>, <code>Keytruda</code>, and <code>MK-3475</code>
+    are correctly grouped as one drug; rare/early-pipeline drugs without MeSH may show under
+    multiple labels until manually mapped.
+  </div>
+</details>
+
 {form}
 """
 
     if not query:
-        # Empty state — show some popular conditions to seed exploration
+        # Empty state — show some popular conditions to seed exploration. Sort by
+        # the count of pivotal trials so the homepage chips lead with the
+        # best-evidenced conditions.
         popular_conds = (
-            index.groupby("condition_label")["n_scored"].sum()
+            index.groupby("condition_label")["pivotal_n_trials"].sum()
             .sort_values(ascending=False).head(15)
         )
         cond_chips = "".join(
@@ -1253,6 +1275,20 @@ def main() -> None:
     print(f"Bound to {BIND_HOST}:{PORT}")
     if BIND_HOST == "0.0.0.0":
         print("(External connections allowed — exposing via ngrok or cloud deploy.)")
+
+    # Pre-warm caches so the first request from a browser is instant.
+    # In demo mode we eagerly build both the panel and the drug index, since
+    # otherwise the first /compare hit takes 10-15s and browsers abort.
+    if DEMO_MODE:
+        print("Pre-loading demo data...", end=" ", flush=True)
+        try:
+            _load_demo_panel()
+            _compute_findings()
+            _load_drug_index()
+            print("done.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"(warning: {type(exc).__name__}: {exc})")
+
     print("Press Ctrl+C to stop.")
     # Only auto-open the browser when running locally — skip when deployed/exposed.
     if os.environ.get("AUTO_OPEN_BROWSER", "1") == "1" and BIND_HOST != "0.0.0.0":
