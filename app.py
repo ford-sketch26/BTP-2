@@ -873,12 +873,19 @@ def _run_view(ticker: str, max_pages: int, drill_nct: str | None) -> str:
 
 # Cached drug-vs-condition index
 _DRUG_INDEX: pd.DataFrame | None = None
+_DRUG_INDEX_LOCK = threading.Lock()
 
 
 def _load_drug_index() -> pd.DataFrame:
     """Build (and cache) the (drug, condition) -> aggregated safety index."""
     global _DRUG_INDEX
-    if _DRUG_INDEX is None:
+    if _DRUG_INDEX is not None:
+        return _DRUG_INDEX
+    with _DRUG_INDEX_LOCK:
+        # Double-check after acquiring the lock — another thread may have
+        # finished building while we were waiting.
+        if _DRUG_INDEX is not None:
+            return _DRUG_INDEX
         panel = _load_demo_panel() if DEMO_MODE else None
         if panel is None or panel.empty:
             _DRUG_INDEX = pd.DataFrame()
@@ -1276,18 +1283,24 @@ def main() -> None:
     if BIND_HOST == "0.0.0.0":
         print("(External connections allowed — exposing via ngrok or cloud deploy.)")
 
-    # Pre-warm caches so the first request from a browser is instant.
-    # In demo mode we eagerly build both the panel and the drug index, since
-    # otherwise the first /compare hit takes 10-15s and browsers abort.
+    # Pre-warm caches in a background thread so the server starts accepting
+    # requests immediately. Cloud platforms (Render free tier) health-check the
+    # port within seconds — if we block startup on the 10-15s drug-index build,
+    # the health check times out and the deploy returns 502 to clients.
+    # Trade-off: the very first /compare hit may wait if it lands mid-build,
+    # but / and /run respond instantly so health checks pass.
     if DEMO_MODE:
-        print("Pre-loading demo data...", end=" ", flush=True)
-        try:
-            _load_demo_panel()
-            _compute_findings()
-            _load_drug_index()
-            print("done.")
-        except Exception as exc:  # noqa: BLE001
-            print(f"(warning: {type(exc).__name__}: {exc})")
+        def _preload_async() -> None:
+            try:
+                _load_demo_panel()
+                _compute_findings()
+                _load_drug_index()
+                print("Pre-load complete (panel + findings + drug index).")
+            except Exception as exc:  # noqa: BLE001
+                print(f"Preload warning: {type(exc).__name__}: {exc}")
+
+        threading.Thread(target=_preload_async, daemon=True).start()
+        print("Pre-loading demo data in background — server is up.")
 
     print("Press Ctrl+C to stop.")
     # Only auto-open the browser when running locally — skip when deployed/exposed.
