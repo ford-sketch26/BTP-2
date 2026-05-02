@@ -23,6 +23,7 @@ data/raw/*
 data/processed/*
 !data/processed/.gitkeep
 !data/processed/safety_panel.csv
+!data/processed/drug_condition_index.csv
 data/cache/watcher/seen_ncts.txt
 
 # OS

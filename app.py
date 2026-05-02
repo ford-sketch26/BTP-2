@@ -874,23 +874,44 @@ def _run_view(ticker: str, max_pages: int, drill_nct: str | None) -> str:
 # Cached drug-vs-condition index
 _DRUG_INDEX: pd.DataFrame | None = None
 _DRUG_INDEX_LOCK = threading.Lock()
+_DRUG_INDEX_PATH = "data/processed/drug_condition_index.csv"
 
 
 def _load_drug_index() -> pd.DataFrame:
-    """Build (and cache) the (drug, condition) -> aggregated safety index."""
+    """Load (or build) the (drug, condition) -> aggregated safety index.
+
+    The full build over 11k trials takes ~40s and uses too much memory for
+    Render's free tier. We commit a pre-built CSV at ``_DRUG_INDEX_PATH`` and
+    just read it here. Falls back to building from the panel if the CSV is
+    missing — useful for local dev after a fresh ``python -m src.build_panel``.
+    """
     global _DRUG_INDEX
     if _DRUG_INDEX is not None:
         return _DRUG_INDEX
+
     with _DRUG_INDEX_LOCK:
-        # Double-check after acquiring the lock — another thread may have
-        # finished building while we were waiting.
         if _DRUG_INDEX is not None:
             return _DRUG_INDEX
+
+        # Fast path: pre-built CSV
+        try:
+            _DRUG_INDEX = pd.read_csv(_DRUG_INDEX_PATH)
+            return _DRUG_INDEX
+        except FileNotFoundError:
+            pass
+
+        # Slow path: build it (local dev only)
+        print(f"[drug index] {_DRUG_INDEX_PATH} not found, building from panel (~40s)...")
         panel = _load_demo_panel() if DEMO_MODE else None
         if panel is None or panel.empty:
             _DRUG_INDEX = pd.DataFrame()
         else:
             _DRUG_INDEX = build_drug_condition_index(panel)
+            try:
+                _DRUG_INDEX.to_csv(_DRUG_INDEX_PATH, index=False)
+                print(f"[drug index] cached to {_DRUG_INDEX_PATH}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[drug index] could not cache: {exc}")
     return _DRUG_INDEX
 
 

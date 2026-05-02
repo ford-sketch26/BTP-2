@@ -122,6 +122,17 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     panel.to_csv(args.output, index=False)
 
+    # Also build the drug-condition index so the deployed app doesn't have to.
+    # Building it costs ~40s; ship the CSV instead of recomputing on each cold start.
+    try:
+        from src.comparator import build_drug_condition_index
+        idx = build_drug_condition_index(panel)
+        idx_path = args.output.parent / "drug_condition_index.csv"
+        idx.to_csv(idx_path, index=False)
+        print(f"Drug-condition index saved -> {idx_path} ({len(idx):,} rows)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: could not build drug-condition index: {exc}")
+
     print()
     print("=" * 70)
     print(f"Panel saved -> {args.output}")
