@@ -25,6 +25,7 @@ from src.comparator import (
     alternatives_for_condition,
     alternatives_for_drug,
     build_drug_condition_index,
+    list_distinct_conditions,
     search as comparator_search,
 )
 from src.data_cleaner import flatten, flatten_arms
@@ -886,7 +887,120 @@ def _load_drug_index() -> pd.DataFrame:
     return _DRUG_INDEX
 
 
-def _compare_view(query: str, by: str) -> str:
+def _rate_pill(rate: float | None) -> str:
+    """Colour a raw drug-arm serious-event rate (no placebo comparison available)."""
+    if rate is None or pd.isna(rate):
+        return '<span class="score-pill unknown">N/A</span>'
+    pct = rate * 100
+    # Higher raw rate = more concerning; thresholds different from safety_score
+    if rate >= 0.30:
+        cls = "scary"
+    elif rate >= 0.15:
+        cls = "warn"
+    else:
+        cls = "clean"
+    return f'<span class="score-pill {cls}">{pct:.1f}%</span>'
+
+
+def _scored_table_html(group: pd.DataFrame) -> str:
+    """Drugs in this condition with placebo-comparison data — the primary ranking."""
+    rows = []
+    for _, r in group.iterrows():
+        rows.append(f"""
+<tr>
+  <td>{_score_pill(r['weighted_score'])}</td>
+  <td><strong>{_esc(r['drug_label'])}</strong></td>
+  <td>{int(r['n_trials'])}</td>
+  <td>{int(r['n_scored'])}</td>
+  <td>{_esc(r.get('sponsors',''))[:60]}</td>
+  <td>{_esc(r.get('tickers',''))}</td>
+</tr>""")
+    if not rows:
+        return ""
+    return f"""
+<h4 style="margin-top:1em">Drugs with placebo comparison ({len(rows)})</h4>
+<p class="help">Sorted cleanest → scariest. Score = drug-arm serious-event rate minus placebo-arm rate, enrollment-weighted across all trials in the dataset.</p>
+<table>
+<tr><th>Safety score (vs placebo)</th><th>Drug</th>
+    <th>Trials</th><th>Scored</th><th>Sponsors</th><th>Tickers</th></tr>
+{''.join(rows)}
+</table>
+"""
+
+
+def _limited_table_html(group: pd.DataFrame) -> str:
+    """Drugs in this condition WITHOUT a placebo comparison — show drug-arm rate only."""
+    rows = []
+    for _, r in group.iterrows():
+        rows.append(f"""
+<tr>
+  <td>{_rate_pill(r['pooled_drug_rate'])}</td>
+  <td><strong>{_esc(r['drug_label'])}</strong></td>
+  <td>{int(r['n_trials'])}</td>
+  <td>{int(r['drug_affected_total'])}/{int(r['drug_at_risk_total'])}</td>
+  <td>{_esc(r.get('sponsors',''))[:60]}</td>
+  <td>{_esc(r.get('tickers',''))}</td>
+</tr>""")
+    if not rows:
+        return ""
+    return f"""
+<h4 style="margin-top:1.5em">Limited evidence — no placebo to compare against ({len(rows)})</h4>
+<div class="warn-box" style="margin: 0.5em 0">
+  <strong>Read with caution.</strong> These drugs have only single-arm trials (or active-comparator
+  trials) in our dataset — no placebo arm exists to subtract from the drug arm. The number shown is
+  the <em>raw</em> percentage of patients in the drug arm who had at least one serious side effect.
+  This is NOT directly comparable to the safety scores in the table above, because the rate also
+  reflects how sick the patient population was (Phase 1 oncology trials always have high raw rates).
+  Use as supplementary context only.
+</div>
+<table>
+<tr><th>Drug-arm serious rate</th><th>Drug</th>
+    <th>Trials</th><th>Pooled patients (affected/at risk)</th>
+    <th>Sponsors</th><th>Tickers</th></tr>
+{''.join(rows)}
+</table>
+"""
+
+
+def _condition_chips_html(matches: pd.DataFrame, query: str, by: str, current: str | None) -> str:
+    """Render refinement chips when multiple conditions match the search."""
+    distinct = list_distinct_conditions(matches)
+    if len(distinct) <= 1:
+        return ""
+
+    chips = []
+    # "Any condition" reset chip
+    base_url = f"/compare?q={_esc(query)}&by={_esc(by)}"
+    is_all = current is None
+    chips.append(
+        f'<a href="{base_url}" style="display:inline-block;padding:0.4em 0.9em;margin:0.25em;'
+        f'border-radius:18px;text-decoration:none;'
+        f'background:{"#2b6cb0" if is_all else "#edf2f7"};'
+        f'color:{"white" if is_all else "#2d3748"};font-weight:600">All conditions</a>'
+    )
+    for _, row in distinct.head(20).iterrows():
+        c = row["condition_label"]
+        if not c:
+            continue
+        active = (current is not None) and (current.lower() == str(c).lower())
+        chips.append(
+            f'<a href="{base_url}&condition={_esc(c)}" '
+            f'style="display:inline-block;padding:0.4em 0.9em;margin:0.25em;'
+            f'border-radius:18px;text-decoration:none;'
+            f'background:{"#2b6cb0" if active else "#edf2f7"};'
+            f'color:{"white" if active else "#2d3748"}">'
+            f'{_esc(c)} <span style="opacity:0.7">({int(row["n_drugs"])} drugs)</span></a>'
+        )
+
+    return f"""
+<div class="help-box">
+  <strong>Multiple conditions match your search.</strong> Click one to narrow, or stay on "All conditions" to see everything.
+</div>
+<div style="margin: 0.5em 0">{''.join(chips)}</div>
+"""
+
+
+def _compare_view(query: str, by: str, condition_filter: str | None = None) -> str:
     """Render the doctor-facing /compare page."""
     index = _load_drug_index()
 
@@ -897,7 +1011,6 @@ def _compare_view(query: str, by: str) -> str:
 <div class="error">No comparison data available. Run <code>python -m src.build_panel</code> first.</div>
 """)
 
-    # Search form (always shown)
     form = f"""
 <form method="get" action="/compare">
   <div>
@@ -921,21 +1034,21 @@ def _compare_view(query: str, by: str) -> str:
 <a href="/">&larr; home</a>
 <h1>Drug Safety Comparator</h1>
 <p class="subtitle">Pick a condition to see all drugs tested for it (ranked by safety profile),
-or pick a drug to see its competitors. Powered by the same dataset as the per-ticker view —
-just pivoted from "company" to "drug class".</p>
+or pick a drug to see its competitors. Same dataset as the investor view — pivoted from
+"company" to "drug class".</p>
 
 <div class="warn-box">
-  <strong>Definition of "best":</strong> on this page, the drug with the lowest safety score
-  is "cleanest" — i.e., its drug arm caused the smallest excess of serious side effects vs
-  placebo, averaged across all trials. This does NOT measure efficacy, cost, or
-  patient-specific factors. It's a safety-only signal, not a clinical recommendation.
+  <strong>What "best" means here:</strong> the drug with the lowest <em>safety score</em>
+  caused the smallest excess of serious side effects vs placebo, averaged across all trials.
+  This is a safety-only signal — it does NOT measure efficacy, cost, drug interactions, or
+  patient-specific factors. <strong>Not a clinical recommendation.</strong>
 </div>
 
 {form}
 """
 
     if not query:
-        # Empty state — show some popular conditions to seed the doctor's exploration
+        # Empty state — show some popular conditions to seed exploration
         popular_conds = (
             index.groupby("condition_label")["n_scored"].sum()
             .sort_values(ascending=False).head(15)
@@ -956,65 +1069,67 @@ just pivoted from "company" to "drug class".</p>
     # Run the search depending on `by`
     if by == "drug":
         results = alternatives_for_drug(index, query, min_trials=1)
-        title = f"Competitors for drugs matching “{_esc(query)}”"
+        kind = "drug"
     elif by == "condition":
-        results = alternatives_for_condition(index, query, min_trials=1)
-        title = f"Drugs tested for conditions matching “{_esc(query)}”"
+        results = alternatives_for_condition(index, query, min_trials=1, exact_label=condition_filter)
+        kind = "condition"
     else:  # auto
-        # Try condition first, fall back to drug if no condition matches
-        results = alternatives_for_condition(index, query, min_trials=1)
-        title = f"Drugs tested for conditions matching “{_esc(query)}”"
+        results = alternatives_for_condition(index, query, min_trials=1, exact_label=condition_filter)
+        kind = "condition"
         if results.empty:
             results = alternatives_for_drug(index, query, min_trials=1)
-            title = f"Competitors for drugs matching “{_esc(query)}”"
+            kind = "drug"
 
     if results.empty:
         return _page("Compare", intro + f"""
 <h2>No matches</h2>
-<p>Nothing in our dataset matches “{_esc(query)}”. Try one of the popular conditions
-on the <a href="/compare">main compare page</a>, or use a different search term.</p>
+<p>Nothing in our dataset matches “{_esc(query)}”{' for the chosen condition' if condition_filter else ''}.
+Try a broader term or one of the popular conditions on the <a href="/compare">main compare page</a>.</p>
 """)
 
-    # Render results, grouped by condition for readability
-    rows_html = []
-    for cond, group in results.groupby("condition_label", dropna=False):
-        # Sort each condition's drugs by weighted safety score (cleanest first)
-        group_sorted = group.sort_values(
-            ["weighted_score", "n_trials"], ascending=[True, False], na_position="last"
-        )
-        rows_html.append(f'<tr style="background:#f7fafc"><th colspan="6" style="text-align:left">'
-                         f'{_esc(cond)} &nbsp; <span class="help" style="font-weight:normal">'
-                         f'({len(group_sorted)} drug(s) tested)</span></th></tr>')
-        for _, r in group_sorted.iterrows():
-            score = r["weighted_score"]
-            score_html = _score_pill(score)
-            rows_html.append(f"""
-<tr>
-  <td>{score_html}</td>
-  <td><strong>{_esc(r['drug_label'])}</strong></td>
-  <td>{int(r['n_trials'])}</td>
-  <td>{int(r['n_scored'])}</td>
-  <td>{_esc(r.get('sponsors',''))[:80]}</td>
-  <td>{_esc(r.get('tickers',''))}</td>
-</tr>""")
+    # When in `auto` or `condition` mode: render condition refinement chips
+    chips_html = ""
+    if by != "drug":
+        # Re-fetch unfiltered results so the chip list shows ALL matching conditions
+        all_matches = alternatives_for_condition(index, query, min_trials=1)
+        if not all_matches.empty:
+            chips_html = _condition_chips_html(all_matches, query, by, condition_filter)
 
-    table_html = f"""
+    title = (f"Drugs tested for “{_esc(condition_filter or query)}”"
+             if kind == "condition"
+             else f"Competitors of drugs matching “{_esc(query)}”")
+
+    # Per-condition sections, each with two sub-tables (scored vs limited evidence)
+    sections_html = []
+    for cond, group in results.groupby("condition_label", dropna=False):
+        scored = group.dropna(subset=["weighted_score"]).sort_values(
+            ["weighted_score", "n_trials"], ascending=[True, False]
+        )
+        # Drugs without a safety score but with raw drug-arm rate data
+        limited = group[group["weighted_score"].isna() & group["pooled_drug_rate"].notna()].sort_values(
+            "pooled_drug_rate", ascending=True
+        )
+
+        scored_html = _scored_table_html(scored)
+        limited_html = _limited_table_html(limited)
+
+        if not scored_html and not limited_html:
+            continue
+
+        sections_html.append(f"""
+<h3 style="background:#edf2f7;padding:0.6em 0.8em;border-radius:6px;margin-top:1.5em">
+  {_esc(cond)} <span style="font-weight:normal;color:#4a5568">— {len(group)} drug(s) tested</span>
+</h3>
+{scored_html}
+{limited_html}
+""")
+
+    body = f"""
 <h2>{title}</h2>
-<div class="help-box">
-  <strong>How to read:</strong> rows are grouped by condition. Within each group, drugs are
-  ranked from <em>cleanest</em> (lowest weighted safety score, top) to <em>scariest</em>
-  (highest, bottom). Score is enrollment-weighted across all trials we have for that
-  drug-condition pair.
-</div>
-<div class="scroll">
-<table>
-<tr><th>Score</th><th>Drug</th><th>Total trials</th><th>Scoreable trials</th>
-    <th>Sponsors</th><th>Watchlist tickers</th></tr>
-{''.join(rows_html)}
-</table>
-</div>
+{chips_html}
+{''.join(sections_html) if sections_html else '<p><em>No drugs match the current filter.</em></p>'}
 """
-    return _page("Compare", intro + table_html)
+    return _page("Compare", intro + body)
 
 
 # ============================== HTTP =========================================
@@ -1042,7 +1157,8 @@ class Handler(BaseHTTPRequestHandler):
             by = (params.get("by", ["auto"])[0] or "auto").strip().lower()
             if by not in ("auto", "drug", "condition"):
                 by = "auto"
-            self._send(_compare_view(q, by))
+            condition_filter = (params.get("condition", [""])[0] or "").strip() or None
+            self._send(_compare_view(q, by, condition_filter))
             return
         if url.path == "/run":
             params = parse_qs(url.query)

@@ -103,6 +103,11 @@ def _explode_pairs(panel: pd.DataFrame) -> pd.DataFrame:
                     "condition_key": ckey,
                     "condition_label": clabel,
                     "safety_score": t.get("safety_score"),
+                    # drug-arm-only metrics — computable even without a placebo arm.
+                    # These let us include single-arm trials in a separate "limited evidence" view.
+                    "drug_rate": t.get("drug_rate"),
+                    "drug_at_risk": t.get("drug_at_risk"),
+                    "drug_affected": t.get("drug_affected"),
                     "abret_0_20": t.get("abret_0_20"),
                 })
     return pd.DataFrame(rows)
@@ -122,18 +127,30 @@ def build_drug_condition_index(panel: pd.DataFrame) -> pd.DataFrame:
 
     def _agg(g: pd.DataFrame) -> pd.Series:
         scored = g.dropna(subset=["safety_score"])
-        # Display label = most common label (handles capitalization variation)
+        with_drug_rate = g.dropna(subset=["drug_rate"])
         drug_label = g["drug_label"].mode().iloc[0] if not g["drug_label"].empty else ""
         cond_label = g["condition_label"].mode().iloc[0] if not g["condition_label"].empty else ""
 
-        # Enrollment-weighted mean — bigger trials count more
+        # Enrollment-weighted safety score (drug minus placebo) — only when placebo data present
         if not scored.empty:
             weights = scored["enrollment_count"].fillna(1).clip(lower=1)
-            weighted = float((scored["safety_score"] * weights).sum() / weights.sum())
-            mean_s = float(scored["safety_score"].mean())
+            weighted_score = float((scored["safety_score"] * weights).sum() / weights.sum())
+            mean_score = float(scored["safety_score"].mean())
         else:
-            weighted = None
-            mean_s = None
+            weighted_score = None
+            mean_score = None
+
+        # Pooled drug-arm serious-event rate — computable for ANY trial with arm data,
+        # including single-arm trials that don't get a safety score. Pool affected+at_risk
+        # across all NCTs in the (drug × condition) group so big trials weight more naturally.
+        if not with_drug_rate.empty:
+            d_at_risk = float(with_drug_rate["drug_at_risk"].fillna(0).sum())
+            d_affected = float(with_drug_rate["drug_affected"].fillna(0).sum())
+            pooled_drug_rate = d_affected / d_at_risk if d_at_risk > 0 else None
+        else:
+            pooled_drug_rate = None
+            d_at_risk = 0.0
+            d_affected = 0.0
 
         sponsors = sorted({s for s in g["lead_sponsor"].dropna().unique() if s})
         tickers = sorted({t for t in g["ticker"].dropna().unique() if t})
@@ -143,8 +160,12 @@ def build_drug_condition_index(panel: pd.DataFrame) -> pd.DataFrame:
             "condition_label": cond_label,
             "n_trials": len(g),
             "n_scored": len(scored),
-            "mean_score": mean_s,
-            "weighted_score": weighted,
+            "n_with_drug_rate": len(with_drug_rate),
+            "mean_score": mean_score,
+            "weighted_score": weighted_score,
+            "pooled_drug_rate": pooled_drug_rate,
+            "drug_at_risk_total": int(d_at_risk),
+            "drug_affected_total": int(d_affected),
             "sponsors": ", ".join(sponsors),
             "tickers": ", ".join(tickers),
         })
@@ -204,11 +225,37 @@ def alternatives_for_drug(
 
 
 def alternatives_for_condition(
-    index: pd.DataFrame, condition_query: str, min_trials: int = 1,
+    index: pd.DataFrame,
+    condition_query: str,
+    min_trials: int = 1,
+    exact_label: str | None = None,
 ) -> pd.DataFrame:
-    """Given a condition, return all drugs tested for it, ranked by safety score (cleanest first)."""
+    """Given a condition, return all drugs tested for it, ranked by safety score (cleanest first).
+
+    If ``exact_label`` is provided, restrict to rows whose ``condition_label`` matches
+    it exactly (case-insensitive). Useful for the "narrow to specific condition" UI.
+    """
     matches = search(index, condition_query, by="condition")
     if matches.empty:
         return pd.DataFrame()
+    if exact_label:
+        matches = matches[matches["condition_label"].fillna("").str.lower() == exact_label.lower()]
     matches = matches[matches["n_trials"] >= min_trials]
     return matches.sort_values(["weighted_score", "n_trials"], ascending=[True, False], na_position="last")
+
+
+def list_distinct_conditions(matches: pd.DataFrame) -> pd.DataFrame:
+    """For a result set, summarise the distinct conditions present (label + counts).
+
+    Returned columns: ``condition_label``, ``n_drugs``, ``n_trials``.
+    Sorted by ``n_trials`` descending so most-evidence-rich conditions surface first.
+    """
+    if matches.empty:
+        return pd.DataFrame(columns=["condition_label", "n_drugs", "n_trials"])
+    g = (
+        matches.groupby("condition_label", dropna=False)
+        .agg(n_drugs=("drug_key", "nunique"), n_trials=("n_trials", "sum"))
+        .reset_index()
+        .sort_values("n_trials", ascending=False)
+    )
+    return g
